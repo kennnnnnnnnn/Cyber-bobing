@@ -6,10 +6,10 @@ import { RulesTable } from './components/RulesTable';
 import { QueuePanel } from './components/QueuePanel';
 import { HistoryBoard } from './components/HistoryBoard';
 import { playRollingSound, playWinJingle } from './utils/audio';
-import { Volume2, VolumeX, Sparkles, Dices, ChevronDown, ChevronUp, RotateCcw } from 'lucide-react';
+import { Volume2, VolumeX, Sparkles, Dices, ChevronDown, ChevronUp, RotateCcw, Copy, ExternalLink, Radio } from 'lucide-react';
 
-const LOCAL_STORAGE_KEY = 'bobing_my_player_id';
-const LOCAL_STORAGE_NAME = 'bobing_my_player_name';
+const SESSION_STORAGE_KEY = 'bobing_session_player_id';
+const SESSION_STORAGE_NAME = 'bobing_session_player_name';
 
 export default function App() {
   const [gameState, setGameState] = useState<GameState>({
@@ -23,60 +23,164 @@ export default function App() {
     version: 0,
   });
 
+  // 使用 sessionStorage 区分同一浏览器不同 Tab 标签页，支持本地多开多玩家同桌博饼
   const [myPlayerId, setMyPlayerId] = useState<string | null>(() => {
-    return localStorage.getItem(LOCAL_STORAGE_KEY);
+    return sessionStorage.getItem(SESSION_STORAGE_KEY) || null;
   });
 
+  const [onlineCount, setOnlineCount] = useState(1);
+  const [rollingPlayerName, setRollingPlayerName] = useState<string | undefined>(undefined);
   const [localDice, setLocalDice] = useState<number[]>([4, 4, 1, 2, 3, 5]);
   const [isLocalRolling, setIsLocalRolling] = useState(false);
   const [soundEnabled, setSoundEnabled] = useState(true);
+  const soundEnabledRef = useRef(soundEnabled);
+  soundEnabledRef.current = soundEnabled;
+
   const [showTestBar, setShowTestBar] = useState(false);
   const [showResetModal, setShowResetModal] = useState(false);
   const [resetKeepPlayers, setResetKeepPlayers] = useState(true);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
-  const [autoRollForAi, setAutoRollForAi] = useState(false); // 默认不自动代摇，由用户手动点击开始
+  const [autoRollForAi, setAutoRollForAi] = useState(false);
   const [activeTab, setActiveTab] = useState<'game' | 'rules' | 'queue' | 'history'>('game');
 
   const botTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const rollIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
   const showToast = (msg: string) => {
     setToastMessage(msg);
     setTimeout(() => {
       setToastMessage((cur) => (cur === msg ? null : cur));
-    }, 2800);
+    }, 3200);
   };
 
-  // 1. 获取后端游戏状态
+  // 1. 获取后端游戏状态（兜底备用）
   const fetchState = useCallback(async () => {
     try {
       const res = await fetch('/api/game/state');
       if (res.ok) {
-        const data: GameState = await res.json();
-        setGameState(data);
-        if (data.lastRoll && !isLocalRolling) {
-          setLocalDice(data.lastRoll.dice);
+        const data = await res.json();
+        if (data.gameState) {
+          setGameState(data.gameState);
+          if (data.gameState.lastRoll && !isLocalRolling) {
+            setLocalDice(data.gameState.lastRoll.dice);
+          }
+        }
+        if (typeof data.onlineCount === 'number') {
+          setOnlineCount(data.onlineCount);
         }
       }
     } catch {
-      // 离线备用，不报错中断
+      // 离线备用
     }
   }, [isLocalRolling]);
 
+  // 2. 建立 SSE (Server-Sent Events) 全局广播连接，多端多人同屏毫秒级同步！
   useEffect(() => {
-    fetchState();
-    const interval = setInterval(fetchState, 1800);
-    return () => clearInterval(interval);
+    let es: EventSource | null = null;
+    let reconnectTimer: NodeJS.Timeout | null = null;
+
+    const connectSSE = () => {
+      es = new EventSource('/api/game/events');
+
+      es.addEventListener('state', (e) => {
+        try {
+          const payload = JSON.parse(e.data);
+          if (payload.gameState) {
+            setGameState(payload.gameState);
+            if (!payload.gameState.isRolling && payload.gameState.lastRoll) {
+              setLocalDice(payload.gameState.lastRoll.dice);
+            }
+          }
+          if (typeof payload.onlineCount === 'number') {
+            setOnlineCount(payload.onlineCount);
+          }
+        } catch (err) {
+          console.error('SSE state error', err);
+        }
+      });
+
+      es.addEventListener('online_count', (e) => {
+        try {
+          const payload = JSON.parse(e.data);
+          if (typeof payload.onlineCount === 'number') {
+            setOnlineCount(payload.onlineCount);
+          }
+        } catch {}
+      });
+
+      // 监听到全桌有人开始摇骰
+      es.addEventListener('roll_start', (e) => {
+        try {
+          const payload = JSON.parse(e.data);
+          setRollingPlayerName(payload.playerName);
+          setIsLocalRolling(true);
+
+          if (soundEnabledRef.current) {
+            playRollingSound(1100);
+          }
+
+          // 全桌所有人的碗里骰子同时高速翻滚预览
+          if (rollIntervalRef.current) clearInterval(rollIntervalRef.current);
+          rollIntervalRef.current = setInterval(() => {
+            setLocalDice(rollRandomDice());
+          }, 80);
+        } catch (err) {
+          console.error('SSE roll_start error', err);
+        }
+      });
+
+      // 监听到全桌摇骰结算落地
+      es.addEventListener('roll_end', (e) => {
+        try {
+          const payload = JSON.parse(e.data);
+          if (rollIntervalRef.current) {
+            clearInterval(rollIntervalRef.current);
+            rollIntervalRef.current = null;
+          }
+
+          setIsLocalRolling(false);
+          setRollingPlayerName(undefined);
+
+          if (payload.dice) {
+            setLocalDice(payload.dice);
+          }
+          if (payload.gameState) {
+            setGameState(payload.gameState);
+          }
+
+          if (soundEnabledRef.current && payload.result) {
+            playWinJingle(payload.result.category === 'zhuangyuan');
+          }
+
+          if (payload.lastRoll && payload.result) {
+            const bonusText = payload.awarded && payload.result.bonus > 0 ? ` (+¥${payload.result.bonus})` : '';
+            showToast(`🎉【${payload.lastRoll.playerName}】掷出 ${payload.result.title} · ${payload.result.subTitle}${bonusText}`);
+          }
+        } catch (err) {
+          console.error('SSE roll_end error', err);
+        }
+      });
+
+      es.onerror = () => {
+        es?.close();
+        reconnectTimer = setTimeout(connectSSE, 2500);
+      };
+    };
+
+    connectSSE();
+
+    // 周期性兜底轮询
+    const interval = setInterval(fetchState, 3500);
+
+    return () => {
+      if (rollIntervalRef.current) clearInterval(rollIntervalRef.current);
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      clearInterval(interval);
+      es?.close();
+    };
   }, [fetchState]);
 
-  // 如果本地有保存的名字但还没在当前房间中，自动尝试同步加入
-  useEffect(() => {
-    const savedName = localStorage.getItem(LOCAL_STORAGE_NAME);
-    if (savedName && !myPlayerId) {
-      handleJoin(savedName);
-    }
-  }, [myPlayerId]);
-
-  // 2. 玩家登录并加入排队
+  // 3. 玩家登录并加入排队
   const handleJoin = async (name: string) => {
     try {
       const res = await fetch('/api/game/join', {
@@ -87,16 +191,18 @@ export default function App() {
       const data = await res.json();
       if (data.success && data.player) {
         setMyPlayerId(data.player.id);
-        localStorage.setItem(LOCAL_STORAGE_KEY, data.player.id);
-        localStorage.setItem(LOCAL_STORAGE_NAME, name);
+        sessionStorage.setItem(SESSION_STORAGE_KEY, data.player.id);
+        sessionStorage.setItem(SESSION_STORAGE_NAME, name);
         setGameState(data.gameState);
+        showToast(`欢迎【${name}】入席大桌！已进入博饼排队`);
       }
     } catch (err) {
       console.error('加入排队失败', err);
+      showToast('加入排队失败，请重试');
     }
   };
 
-  // 3. 玩家退出排队
+  // 4. 玩家退出排队
   const handleLeave = async () => {
     if (!myPlayerId) return;
     try {
@@ -106,14 +212,16 @@ export default function App() {
         body: JSON.stringify({ playerId: myPlayerId }),
       });
       setMyPlayerId(null);
-      localStorage.removeItem(LOCAL_STORAGE_KEY);
+      sessionStorage.removeItem(SESSION_STORAGE_KEY);
+      sessionStorage.removeItem(SESSION_STORAGE_NAME);
       fetchState();
+      showToast('您已退出当前排队，可换个名字重新加入');
     } catch (err) {
       console.error('退出排队失败', err);
     }
   };
 
-  // 4. 添加模拟好友/电脑玩家
+  // 5. 添加模拟好友/电脑玩家
   const handleAddBot = async () => {
     const botNames = [
       '福星小明',
@@ -126,74 +234,50 @@ export default function App() {
     ];
     const randomName = botNames[Math.floor(Math.random() * botNames.length)];
     try {
-      await fetch('/api/game/join', {
+      const res = await fetch('/api/game/join', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: randomName, isAi: true }),
       });
-      fetchState();
+      const data = await res.json();
+      if (data.success) {
+        showToast(`已邀请好友【${randomName}】入席`);
+      }
     } catch (err) {
       console.error('添加玩家失败', err);
     }
   };
 
-  // 5. 掷骰子动作
+  // 6. 掷骰子动作（全桌广播）
   const handleRoll = async (manualDice?: number[]) => {
     const currentTurn = gameState.players[gameState.currentTurnIndex % gameState.players.length];
     if (!currentTurn) {
-      showToast('当前暂无玩家排队，请先在左侧输入姓名加入！');
+      showToast('当前暂无玩家排队，请先在左侧输入姓名入席！');
       return;
     }
 
-    // 确定掷骰主体：如果是模拟人或手动指定点数或未登录状态，使用 currentTurn.id
     const isAi = Boolean(currentTurn.isAi);
     const effectivePlayerId = isAi || manualDice || !myPlayerId ? currentTurn.id : myPlayerId;
 
-    setIsLocalRolling(true);
-    if (soundEnabled) {
-      playRollingSound(1000);
-    }
-
-    // 前端产生翻滚随机预览
-    const rollInterval = setInterval(() => {
-      setLocalDice(rollRandomDice());
-    }, 80);
-
-    setTimeout(async () => {
-      clearInterval(rollInterval);
-      try {
-        const res = await fetch('/api/game/roll', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            playerId: effectivePlayerId,
-            manualDice,
-          }),
-        });
-        const data = await res.json();
-        if (data.success) {
-          setLocalDice(data.dice);
-          setGameState(data.gameState);
-          setIsLocalRolling(false);
-          if (soundEnabled && data.result) {
-            playWinJingle(data.result.category === 'zhuangyuan');
-          }
-          if (data.result) {
-            const prefix = isAi ? `【${currentTurn.name}】` : '恭喜您！';
-            showToast(`${prefix}摇出 ${data.result.title} · ${data.result.subTitle}${data.awarded && data.result.bonus > 0 ? ` (+¥${data.result.bonus})` : ''}`);
-          }
-        } else {
-          setIsLocalRolling(false);
-          showToast(data.error || '掷骰失败');
-        }
-      } catch {
-        setIsLocalRolling(false);
-        showToast('网络通信异常，请重试');
+    try {
+      const res = await fetch('/api/game/roll', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          playerId: effectivePlayerId,
+          manualDice,
+        }),
+      });
+      const data = await res.json();
+      if (!data.success) {
+        showToast(data.error || '掷骰失败');
       }
-    }, 1100);
+    } catch {
+      showToast('网络通信异常，请重试');
+    }
   };
 
-  // 6. 重置游戏
+  // 7. 重置游戏
   const handleResetGame = async (keepPlayers = resetKeepPlayers) => {
     try {
       const res = await fetch('/api/game/reset', {
@@ -206,12 +290,31 @@ export default function App() {
         setGameState(data.gameState);
         setLocalDice([4, 4, 1, 2, 3, 5]);
         setShowResetModal(false);
-        showToast('🎉 博饼大局已重开！奖池与分数已全部恢复初始');
+        showToast('🎉 全桌博饼大局已重开！奖池与分数已全部恢复初始');
       }
     } catch (err) {
       console.error('重置失败', err);
       showToast('重置失败，请重试');
     }
+  };
+
+  // 复制房间邀请链接
+  const handleCopyInvite = () => {
+    const url = window.location.href;
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(url).then(() => {
+        showToast('📋 邀请链接已复制！发给好友或在手机打开即可同桌博饼');
+      }).catch(() => {
+        showToast(`请复制浏览器地址栏链接发给好友即可：${url}`);
+      });
+    } else {
+      showToast(`请复制浏览器地址栏链接发给好友即可：${url}`);
+    }
+  };
+
+  // 在新标签页打开（方便本地多开多玩家同屏测试）
+  const handleOpenNewWindow = () => {
+    window.open(window.location.href, '_blank');
   };
 
   // 当前轮到的玩家判定
@@ -244,7 +347,6 @@ export default function App() {
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.code === 'Space' && canRoll && !isLocalRolling) {
-        // 如果焦点在输入框中则不触发
         const tag = (e.target as HTMLElement)?.tagName;
         if (tag === 'INPUT' || tag === 'TEXTAREA') return;
         e.preventDefault();
@@ -271,17 +373,41 @@ export default function App() {
                 <h1 className="text-lg sm:text-2xl font-black text-amber-300 tracking-wider drop-shadow-md">
                   中秋在线博饼
                 </h1>
-                <span className="bg-amber-400/20 text-amber-200 text-[11px] px-2 py-0.5 rounded-full border border-amber-300/40 hidden sm:inline">
-                  闽南传统民俗 · 现金大奖
-                </span>
+                <div className="flex items-center gap-1.5 bg-emerald-950/80 text-emerald-300 border border-emerald-500/40 text-[11px] px-2 py-0.5 rounded-full font-medium shadow-sm">
+                  <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
+                  <span>在线同桌 {onlineCount} 人</span>
+                </div>
               </div>
               <p className="text-[11px] text-amber-200/70 hidden sm:block">
-                固定6个骰子 · 登录姓名排队摇骰 · 状元插金花/六杯红/对堂/三红/四进
+                固定6个骰子 · 全员同屏同桌 · 状元插金花/六杯红/对堂/三红/四进
               </p>
             </div>
           </div>
 
           <div className="flex items-center gap-2">
+            {/* 复制邀请链接 */}
+            <button
+              id="btn-copy-invite"
+              onClick={handleCopyInvite}
+              className="px-2.5 py-1.5 rounded-lg bg-amber-400/20 hover:bg-amber-400/30 text-amber-200 text-xs border border-amber-300/40 flex items-center gap-1.5 transition-colors cursor-pointer"
+              title="复制当前房间链接发给好友，大家打开即可同桌博饼"
+            >
+              <Copy className="w-3.5 h-3.5 text-amber-300" />
+              <span className="hidden md:inline">邀请同桌好友</span>
+              <span className="md:hidden">邀请</span>
+            </button>
+
+            {/* 本地多开窗口测试 */}
+            <button
+              id="btn-open-multiwindow"
+              onClick={handleOpenNewWindow}
+              className="px-2.5 py-1.5 rounded-lg bg-amber-400/20 hover:bg-amber-400/30 text-amber-200 text-xs border border-amber-300/40 hidden sm:flex items-center gap-1.5 transition-colors cursor-pointer"
+              title="在新的标签页中打开，作为第2个玩家同桌博饼（用于本地测试）"
+            >
+              <ExternalLink className="w-3.5 h-3.5 text-amber-300" />
+              <span>多开窗口测试</span>
+            </button>
+
             {/* 重新开局按钮 */}
             <button
               id="btn-header-reset-game"
@@ -477,7 +603,7 @@ export default function App() {
           {/* 当前掷骰者提醒卡片 */}
           <div className="w-full bg-red-950/70 border border-amber-300/40 rounded-2xl p-3 mb-4 text-center shadow-lg">
             <div className="text-xs text-amber-200/80 flex items-center justify-between px-1">
-              <span>当前回合掷骰玩家</span>
+              <span>{isLocalRolling ? '🎲 正在大力摇骰中' : '当前回合掷骰玩家'}</span>
               {currentPlayer?.isAi && (
                 <label className="text-[11px] flex items-center gap-1 cursor-pointer select-none text-amber-300 hover:text-amber-100">
                   <input
@@ -491,16 +617,24 @@ export default function App() {
               )}
             </div>
             <div className="text-lg font-black text-amber-300 mt-1 flex items-center justify-center gap-2">
-              <span>{currentPlayer ? currentPlayer.name : '暂无玩家排队'}</span>
-              {isMyTurn && (
-                <span className="bg-amber-400 text-red-950 text-xs px-2 py-0.5 rounded-full font-bold animate-bounce">
-                  轮到你啦
+              <span>{isLocalRolling ? (rollingPlayerName || currentPlayer?.name || '玩家') : (currentPlayer ? currentPlayer.name : '暂无玩家排队')}</span>
+              {isLocalRolling ? (
+                <span className="bg-amber-400 text-red-950 text-xs px-2 py-0.5 rounded-full font-bold animate-pulse">
+                  翻滚中...
                 </span>
-              )}
-              {isAiTurn && (
-                <span className="bg-amber-500/20 text-amber-300 border border-amber-300/40 text-xs px-2 py-0.5 rounded-full font-semibold">
-                  模拟好友 (您可点击下方直接代摇)
-                </span>
+              ) : (
+                <>
+                  {isMyTurn && (
+                    <span className="bg-amber-400 text-red-950 text-xs px-2 py-0.5 rounded-full font-bold animate-bounce">
+                      轮到你啦
+                    </span>
+                  )}
+                  {isAiTurn && (
+                    <span className="bg-amber-500/20 text-amber-300 border border-amber-300/40 text-xs px-2 py-0.5 rounded-full font-semibold">
+                      模拟好友 (您可点击下方直接代摇)
+                    </span>
+                  )}
+                </>
               )}
             </div>
           </div>
@@ -514,6 +648,7 @@ export default function App() {
             lastResult={gameState.lastRoll?.result}
             awarded={gameState.lastRoll?.awarded}
             currentTurnPlayerName={currentPlayer?.name}
+            rollingPlayerName={rollingPlayerName}
             isMyTurn={isMyTurn}
             isAiTurn={isAiTurn}
           />

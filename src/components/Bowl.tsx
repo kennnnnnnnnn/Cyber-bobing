@@ -11,6 +11,7 @@ interface BowlProps {
   lastResult?: BobingResult | null;
   awarded?: boolean;
   currentTurnPlayerName?: string;
+  rollingPlayerName?: string;
   isMyTurn?: boolean;
   isAiTurn?: boolean;
 }
@@ -23,6 +24,7 @@ export const Bowl: React.FC<BowlProps> = ({
   lastResult,
   awarded,
   currentTurnPlayerName,
+  rollingPlayerName,
   isMyTurn = false,
   isAiTurn = false,
 }) => {
@@ -185,7 +187,7 @@ export const Bowl: React.FC<BowlProps> = ({
         >
           <span>
             {isRolling
-              ? '🎲 骰子翻滚中...'
+              ? `🎲 【${rollingPlayerName || currentTurnPlayerName || '玩家'}】正在大力摇骰中...`
               : isMyTurn
               ? '🎲 掷骰博饼 (轮到你了)'
               : isAiTurn
