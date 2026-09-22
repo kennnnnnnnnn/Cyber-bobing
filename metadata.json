@@ -1,0 +1,6 @@
+{
+  "name": "中秋在线博饼",
+  "description": "传统中秋在线博饼游戏，支持输入姓名排队摇骰子、6骰点数规则判定、阶段解锁与奖池统计。",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
