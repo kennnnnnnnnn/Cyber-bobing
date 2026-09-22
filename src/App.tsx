@@ -1,12 +1,12 @@
 import { useEffect, useState, useRef, useCallback } from 'react';
-import { GameState, Player } from './types';
-import { INITIAL_PRIZES, rollRandomDice } from './utils/bobingRules';
+import { GameState, Player, BobingResult, PrizePool, RollRecord } from './types';
+import { INITIAL_PRIZES, rollRandomDice, evaluateDice } from './utils/bobingRules';
 import { Bowl } from './components/Bowl';
 import { RulesTable } from './components/RulesTable';
 import { QueuePanel } from './components/QueuePanel';
 import { HistoryBoard } from './components/HistoryBoard';
 import { playRollingSound, playWinJingle } from './utils/audio';
-import { Volume2, VolumeX, Sparkles, Dices, ChevronDown, ChevronUp, RotateCcw, Copy, ExternalLink, Radio } from 'lucide-react';
+import { Volume2, VolumeX, Sparkles, Dices, ChevronDown, ChevronUp, RotateCcw, Copy, ExternalLink, HelpCircle, Server, CheckCircle2 } from 'lucide-react';
 
 const SESSION_STORAGE_KEY = 'bobing_session_player_id';
 const SESSION_STORAGE_NAME = 'bobing_session_player_name';
@@ -28,6 +28,8 @@ export default function App() {
     return sessionStorage.getItem(SESSION_STORAGE_KEY) || null;
   });
 
+  // 连接模式：'online' (Node.js服务端实时全服同步) 或 'local' (离线/纯静态部署兜底，不中断游玩)
+  const [connectionMode, setConnectionMode] = useState<'online' | 'local'>('online');
   const [onlineCount, setOnlineCount] = useState(1);
   const [rollingPlayerName, setRollingPlayerName] = useState<string | undefined>(undefined);
   const [localDice, setLocalDice] = useState<number[]>([4, 4, 1, 2, 3, 5]);
@@ -38,6 +40,7 @@ export default function App() {
 
   const [showTestBar, setShowTestBar] = useState(false);
   const [showResetModal, setShowResetModal] = useState(false);
+  const [showDeployModal, setShowDeployModal] = useState(false);
   const [resetKeepPlayers, setResetKeepPlayers] = useState(true);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [autoRollForAi, setAutoRollForAi] = useState(false);
@@ -59,6 +62,7 @@ export default function App() {
       const res = await fetch('/api/game/state');
       if (res.ok) {
         const data = await res.json();
+        setConnectionMode('online');
         if (data.gameState) {
           setGameState(data.gameState);
           if (data.gameState.lastRoll && !isLocalRolling) {
@@ -68,9 +72,13 @@ export default function App() {
         if (typeof data.onlineCount === 'number') {
           setOnlineCount(data.onlineCount);
         }
+      } else {
+        // 后端非200（例如404静态服务器）
+        setConnectionMode('local');
       }
     } catch {
-      // 离线备用
+      // 离线备用，自动降级为本地独立模式
+      setConnectionMode('local');
     }
   }, [isLocalRolling]);
 
@@ -80,91 +88,98 @@ export default function App() {
     let reconnectTimer: NodeJS.Timeout | null = null;
 
     const connectSSE = () => {
-      es = new EventSource('/api/game/events');
+      try {
+        es = new EventSource('/api/game/events');
 
-      es.addEventListener('state', (e) => {
-        try {
-          const payload = JSON.parse(e.data);
-          if (payload.gameState) {
-            setGameState(payload.gameState);
-            if (!payload.gameState.isRolling && payload.gameState.lastRoll) {
-              setLocalDice(payload.gameState.lastRoll.dice);
+        es.addEventListener('state', (e) => {
+          try {
+            const payload = JSON.parse(e.data);
+            setConnectionMode('online');
+            if (payload.gameState) {
+              setGameState(payload.gameState);
+              if (!payload.gameState.isRolling && payload.gameState.lastRoll) {
+                setLocalDice(payload.gameState.lastRoll.dice);
+              }
             }
+            if (typeof payload.onlineCount === 'number') {
+              setOnlineCount(payload.onlineCount);
+            }
+          } catch (err) {
+            console.error('SSE state error', err);
           }
-          if (typeof payload.onlineCount === 'number') {
-            setOnlineCount(payload.onlineCount);
+        });
+
+        es.addEventListener('online_count', (e) => {
+          try {
+            const payload = JSON.parse(e.data);
+            if (typeof payload.onlineCount === 'number') {
+              setOnlineCount(payload.onlineCount);
+            }
+          } catch {}
+        });
+
+        // 监听到全桌有人开始摇骰
+        es.addEventListener('roll_start', (e) => {
+          try {
+            const payload = JSON.parse(e.data);
+            setRollingPlayerName(payload.playerName);
+            setIsLocalRolling(true);
+
+            if (soundEnabledRef.current) {
+              playRollingSound(1100);
+            }
+
+            // 全桌所有人的碗里骰子同时高速翻滚预览
+            if (rollIntervalRef.current) clearInterval(rollIntervalRef.current);
+            rollIntervalRef.current = setInterval(() => {
+              setLocalDice(rollRandomDice());
+            }, 80);
+          } catch (err) {
+            console.error('SSE roll_start error', err);
           }
-        } catch (err) {
-          console.error('SSE state error', err);
-        }
-      });
+        });
 
-      es.addEventListener('online_count', (e) => {
-        try {
-          const payload = JSON.parse(e.data);
-          if (typeof payload.onlineCount === 'number') {
-            setOnlineCount(payload.onlineCount);
+        // 监听到全桌摇骰结算落地
+        es.addEventListener('roll_end', (e) => {
+          try {
+            const payload = JSON.parse(e.data);
+            if (rollIntervalRef.current) {
+              clearInterval(rollIntervalRef.current);
+              rollIntervalRef.current = null;
+            }
+
+            setIsLocalRolling(false);
+            setRollingPlayerName(undefined);
+
+            if (payload.dice) {
+              setLocalDice(payload.dice);
+            }
+            if (payload.gameState) {
+              setGameState(payload.gameState);
+            }
+
+            if (soundEnabledRef.current && payload.result) {
+              playWinJingle(payload.result.category === 'zhuangyuan');
+            }
+
+            if (payload.lastRoll && payload.result) {
+              const bonusText = payload.awarded && payload.result.bonus > 0 ? ` (+¥${payload.result.bonus})` : '';
+              showToast(`🎉【${payload.lastRoll.playerName}】掷出 ${payload.result.title} · ${payload.result.subTitle}${bonusText}`);
+            }
+          } catch (err) {
+            console.error('SSE roll_end error', err);
           }
-        } catch {}
-      });
+        });
 
-      // 监听到全桌有人开始摇骰
-      es.addEventListener('roll_start', (e) => {
-        try {
-          const payload = JSON.parse(e.data);
-          setRollingPlayerName(payload.playerName);
-          setIsLocalRolling(true);
-
-          if (soundEnabledRef.current) {
-            playRollingSound(1100);
-          }
-
-          // 全桌所有人的碗里骰子同时高速翻滚预览
-          if (rollIntervalRef.current) clearInterval(rollIntervalRef.current);
-          rollIntervalRef.current = setInterval(() => {
-            setLocalDice(rollRandomDice());
-          }, 80);
-        } catch (err) {
-          console.error('SSE roll_start error', err);
-        }
-      });
-
-      // 监听到全桌摇骰结算落地
-      es.addEventListener('roll_end', (e) => {
-        try {
-          const payload = JSON.parse(e.data);
-          if (rollIntervalRef.current) {
-            clearInterval(rollIntervalRef.current);
-            rollIntervalRef.current = null;
-          }
-
-          setIsLocalRolling(false);
-          setRollingPlayerName(undefined);
-
-          if (payload.dice) {
-            setLocalDice(payload.dice);
-          }
-          if (payload.gameState) {
-            setGameState(payload.gameState);
-          }
-
-          if (soundEnabledRef.current && payload.result) {
-            playWinJingle(payload.result.category === 'zhuangyuan');
-          }
-
-          if (payload.lastRoll && payload.result) {
-            const bonusText = payload.awarded && payload.result.bonus > 0 ? ` (+¥${payload.result.bonus})` : '';
-            showToast(`🎉【${payload.lastRoll.playerName}】掷出 ${payload.result.title} · ${payload.result.subTitle}${bonusText}`);
-          }
-        } catch (err) {
-          console.error('SSE roll_end error', err);
-        }
-      });
-
-      es.onerror = () => {
-        es?.close();
-        reconnectTimer = setTimeout(connectSSE, 2500);
-      };
+        es.onerror = () => {
+          es?.close();
+          // 如果连接失败，标记为本地模式并延迟重试
+          setConnectionMode('local');
+          reconnectTimer = setTimeout(connectSSE, 5000);
+        };
+      } catch {
+        setConnectionMode('local');
+      }
     };
 
     connectSSE();
@@ -180,25 +195,63 @@ export default function App() {
     };
   }, [fetchState]);
 
-  // 3. 玩家登录并加入排队
-  const handleJoin = async (name: string) => {
+  // 3. 玩家登录并加入排队（支持服务端同步与无缝本地兜底）
+  const handleJoin = async (name: string, isAi = false) => {
+    const trimmedName = name.trim().slice(0, 12);
+    if (!trimmedName) return;
+
+    // 先尝试连接后端 Node 服务
     try {
       const res = await fetch('/api/game/join', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name }),
+        body: JSON.stringify({ name: trimmedName, isAi }),
       });
-      const data = await res.json();
-      if (data.success && data.player) {
-        setMyPlayerId(data.player.id);
-        sessionStorage.setItem(SESSION_STORAGE_KEY, data.player.id);
-        sessionStorage.setItem(SESSION_STORAGE_NAME, name);
-        setGameState(data.gameState);
-        showToast(`欢迎【${name}】入席大桌！已进入博饼排队`);
+
+      if (res.ok) {
+        const data = await res.json();
+        if (data.success && data.player) {
+          setConnectionMode('online');
+          if (!isAi) {
+            setMyPlayerId(data.player.id);
+            sessionStorage.setItem(SESSION_STORAGE_KEY, data.player.id);
+            sessionStorage.setItem(SESSION_STORAGE_NAME, trimmedName);
+            showToast(`欢迎【${trimmedName}】入席大桌！已进入博饼排队`);
+          } else {
+            showToast(`已邀请好友【${trimmedName}】入席`);
+          }
+          setGameState(data.gameState);
+          return;
+        }
       }
-    } catch (err) {
-      console.error('加入排队失败', err);
-      showToast('加入排队失败，请重试');
+    } catch {
+      // 网络请求或服务不可用，进入本地独立模式
+    }
+
+    // === 本地单机/离线优雅降级处理 ===
+    setConnectionMode('local');
+    const localPlayer: Player = {
+      id: 'p_loc_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6),
+      name: trimmedName,
+      joinedAt: Date.now(),
+      totalBonus: 0,
+      winsCount: 0,
+      isAi,
+    };
+
+    setGameState((prev) => ({
+      ...prev,
+      players: [...prev.players, localPlayer],
+      version: prev.version + 1,
+    }));
+
+    if (!isAi) {
+      setMyPlayerId(localPlayer.id);
+      sessionStorage.setItem(SESSION_STORAGE_KEY, localPlayer.id);
+      sessionStorage.setItem(SESSION_STORAGE_NAME, trimmedName);
+      showToast(`🎉 欢迎【${trimmedName}】！已成功加入博饼排队`);
+    } else {
+      showToast(`已邀请模拟好友【${trimmedName}】入席`);
     }
   };
 
@@ -211,14 +264,30 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ playerId: myPlayerId }),
       });
-      setMyPlayerId(null);
-      sessionStorage.removeItem(SESSION_STORAGE_KEY);
-      sessionStorage.removeItem(SESSION_STORAGE_NAME);
-      fetchState();
-      showToast('您已退出当前排队，可换个名字重新加入');
-    } catch (err) {
-      console.error('退出排队失败', err);
+    } catch {
+      // 忽略服务端通信失败
     }
+
+    setGameState((prev) => {
+      const idx = prev.players.findIndex((p) => p.id === myPlayerId);
+      if (idx !== -1) {
+        const newPlayers = [...prev.players];
+        newPlayers.splice(idx, 1);
+        const nextTurn = prev.currentTurnIndex >= newPlayers.length ? 0 : prev.currentTurnIndex;
+        return {
+          ...prev,
+          players: newPlayers,
+          currentTurnIndex: nextTurn,
+          version: prev.version + 1,
+        };
+      }
+      return prev;
+    });
+
+    setMyPlayerId(null);
+    sessionStorage.removeItem(SESSION_STORAGE_KEY);
+    sessionStorage.removeItem(SESSION_STORAGE_NAME);
+    showToast('您已退出当前排队，可换个名字重新加入');
   };
 
   // 5. 添加模拟好友/电脑玩家
@@ -233,69 +302,166 @@ export default function App() {
       '探花阿祥',
     ];
     const randomName = botNames[Math.floor(Math.random() * botNames.length)];
-    try {
-      const res = await fetch('/api/game/join', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: randomName, isAi: true }),
-      });
-      const data = await res.json();
-      if (data.success) {
-        showToast(`已邀请好友【${randomName}】入席`);
-      }
-    } catch (err) {
-      console.error('添加玩家失败', err);
-    }
+    handleJoin(randomName, true);
   };
 
-  // 6. 掷骰子动作（全桌广播）
+  // 6. 掷骰子动作（支持全桌广播与本地引擎双模驱动）
   const handleRoll = async (manualDice?: number[]) => {
+    if (gameState.players.length === 0) {
+      showToast('当前暂无玩家排队，请先在左侧输入姓名入席！');
+      return;
+    }
+
     const currentTurn = gameState.players[gameState.currentTurnIndex % gameState.players.length];
     if (!currentTurn) {
-      showToast('当前暂无玩家排队，请先在左侧输入姓名入席！');
+      showToast('当前暂无玩家排队，请先入席！');
       return;
     }
 
     const isAi = Boolean(currentTurn.isAi);
     const effectivePlayerId = isAi || manualDice || !myPlayerId ? currentTurn.id : myPlayerId;
 
-    try {
-      const res = await fetch('/api/game/roll', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          playerId: effectivePlayerId,
-          manualDice,
-        }),
-      });
-      const data = await res.json();
-      if (!data.success) {
-        showToast(data.error || '掷骰失败');
+    // 优先尝试服务端 API
+    if (connectionMode === 'online') {
+      try {
+        const res = await fetch('/api/game/roll', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            playerId: effectivePlayerId,
+            manualDice,
+          }),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (data.success) {
+            return; // 服务端已接管并通过 SSE 广播给全桌
+          }
+        }
+      } catch {
+        // 服务端失败则无缝回退到本地摇骰引擎
       }
-    } catch {
-      showToast('网络通信异常，请重试');
     }
+
+    // === 本地单机摇骰执行引擎 ===
+    setIsLocalRolling(true);
+    setRollingPlayerName(currentTurn.name);
+    if (soundEnabled) {
+      playRollingSound(1100);
+    }
+
+    if (rollIntervalRef.current) clearInterval(rollIntervalRef.current);
+    rollIntervalRef.current = setInterval(() => {
+      setLocalDice(rollRandomDice());
+    }, 80);
+
+    setTimeout(() => {
+      if (rollIntervalRef.current) {
+        clearInterval(rollIntervalRef.current);
+        rollIntervalRef.current = null;
+      }
+      setIsLocalRolling(false);
+      setRollingPlayerName(undefined);
+
+      // 计算点数
+      const finalDice = Array.isArray(manualDice) && manualDice.length === 6
+        ? manualDice.map((n) => Math.min(6, Math.max(1, Math.floor(n))))
+        : rollRandomDice();
+
+      setLocalDice(finalDice);
+
+      setGameState((prev) => {
+        const currentP = prev.players[prev.currentTurnIndex % prev.players.length];
+        if (!currentP) return prev;
+
+        const nextPrizes = { ...prev.prizes };
+        const result: BobingResult = evaluateDice(finalDice, nextPrizes);
+
+        let awarded = false;
+        if (result.category !== 'none' && result.isUnlocked) {
+          const prizeKey = result.category as keyof PrizePool;
+          if (nextPrizes[prizeKey] > 0) {
+            nextPrizes[prizeKey]--;
+            currentP.totalBonus += result.bonus;
+            currentP.winsCount += 1;
+            awarded = true;
+          }
+        }
+
+        const record: RollRecord = {
+          id: 'r_loc_' + Date.now(),
+          playerId: currentP.id,
+          playerName: currentP.name,
+          dice: finalDice,
+          category: result.category,
+          title: result.title,
+          subTitle: result.subTitle,
+          bonus: result.bonus,
+          timestamp: Date.now(),
+          awarded,
+          note: result.lockReason,
+        };
+
+        const newHistory = [record, ...prev.history].slice(0, 60);
+        const nextTurn = (prev.currentTurnIndex + 1) % prev.players.length;
+
+        if (soundEnabledRef.current && result) {
+          playWinJingle(result.category === 'zhuangyuan');
+        }
+
+        const bonusText = awarded && result.bonus > 0 ? ` (+¥${result.bonus})` : '';
+        showToast(`🎉【${currentP.name}】掷出 ${result.title} · ${result.subTitle}${bonusText}`);
+
+        return {
+          ...prev,
+          prizes: nextPrizes,
+          history: newHistory,
+          lastRoll: {
+            playerId: currentP.id,
+            playerName: currentP.name,
+            dice: finalDice,
+            result,
+            awarded,
+            timestamp: Date.now(),
+          },
+          currentTurnIndex: nextTurn,
+          version: prev.version + 1,
+        };
+      });
+    }, 1100);
   };
 
   // 7. 重置游戏
   const handleResetGame = async (keepPlayers = resetKeepPlayers) => {
     try {
-      const res = await fetch('/api/game/reset', {
+      await fetch('/api/game/reset', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ keepPlayers }),
       });
-      const data = await res.json();
-      if (data.success) {
-        setGameState(data.gameState);
-        setLocalDice([4, 4, 1, 2, 3, 5]);
-        setShowResetModal(false);
-        showToast('🎉 全桌博饼大局已重开！奖池与分数已全部恢复初始');
-      }
-    } catch (err) {
-      console.error('重置失败', err);
-      showToast('重置失败，请重试');
+    } catch {
+      // 忽略服务端错误
     }
+
+    setGameState((prev) => {
+      const updatedPlayers = keepPlayers
+        ? prev.players.map((p) => ({ ...p, totalBonus: 0, winsCount: 0 }))
+        : [];
+      return {
+        ...prev,
+        players: updatedPlayers,
+        prizes: { ...INITIAL_PRIZES },
+        history: [],
+        lastRoll: null,
+        currentTurnIndex: 0,
+        isRolling: false,
+        version: prev.version + 1,
+      };
+    });
+
+    setLocalDice([4, 4, 1, 2, 3, 5]);
+    setShowResetModal(false);
+    showToast('🎉 博饼大局已重开！奖池与分数已全部恢复初始');
   };
 
   // 复制房间邀请链接
@@ -373,10 +539,22 @@ export default function App() {
                 <h1 className="text-lg sm:text-2xl font-black text-amber-300 tracking-wider drop-shadow-md">
                   中秋在线博饼
                 </h1>
-                <div className="flex items-center gap-1.5 bg-emerald-950/80 text-emerald-300 border border-emerald-500/40 text-[11px] px-2 py-0.5 rounded-full font-medium shadow-sm">
-                  <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
-                  <span>在线同桌 {onlineCount} 人</span>
-                </div>
+                {connectionMode === 'online' ? (
+                  <div className="flex items-center gap-1.5 bg-emerald-950/80 text-emerald-300 border border-emerald-500/40 text-[11px] px-2 py-0.5 rounded-full font-medium shadow-sm">
+                    <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
+                    <span>多人联机中 ({onlineCount}人同桌)</span>
+                  </div>
+                ) : (
+                  <button
+                    onClick={() => setShowDeployModal(true)}
+                    className="flex items-center gap-1.5 bg-amber-950/80 text-amber-300 border border-amber-500/50 hover:bg-amber-900/80 text-[11px] px-2 py-0.5 rounded-full font-medium shadow-sm cursor-pointer transition-colors"
+                    title="当前处于本地单机运行模式。点击查看服务器配置指南以开启全服多人同桌联机"
+                  >
+                    <span className="w-2 h-2 rounded-full bg-amber-400" />
+                    <span>本地单机畅玩 (部署帮助)</span>
+                    <HelpCircle className="w-3 h-3 text-amber-400" />
+                  </button>
+                )}
               </div>
               <p className="text-[11px] text-amber-200/70 hidden sm:block">
                 固定6个骰子 · 全员同屏同桌 · 状元插金花/六杯红/对堂/三红/四进
@@ -711,6 +889,85 @@ export default function App() {
                 className="px-5 py-2 rounded-xl bg-gradient-to-r from-amber-400 to-yellow-500 hover:from-amber-300 hover:to-yellow-400 text-red-950 font-bold text-xs shadow-lg active:scale-95 cursor-pointer"
               >
                 确认重开局
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 服务器部署与多人联机配置指南弹窗 */}
+      {showDeployModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-sm p-4 animate-in fade-in">
+          <div className="bg-[#8E0505] border-2 border-amber-300 text-amber-50 rounded-2xl max-w-lg w-full p-5 sm:p-6 shadow-2xl space-y-4 max-h-[90vh] overflow-y-auto">
+            <div className="flex items-center justify-between border-b border-red-800 pb-3">
+              <div className="flex items-center gap-2 text-amber-300">
+                <Server className="w-5 h-5 text-amber-400" />
+                <h3 className="text-base sm:text-lg font-bold">服务器多人同桌联机配置指南</h3>
+              </div>
+              <button
+                onClick={() => setShowDeployModal(false)}
+                className="text-amber-200/70 hover:text-white text-xs px-2 py-1 bg-red-950/60 rounded-lg cursor-pointer"
+              >
+                ✕ 关闭
+              </button>
+            </div>
+
+            <div className="space-y-3 text-xs text-amber-100/90 leading-relaxed">
+              <div className="bg-emerald-950/60 border border-emerald-500/40 rounded-xl p-3 text-emerald-200">
+                <p className="font-bold flex items-center gap-1.5 text-emerald-300 mb-1">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                  当前状态：本地单机引擎已就绪，可正常畅玩
+                </p>
+                <p className="text-[11px] text-emerald-200/80">
+                  您可以在此输入名字排队、添加电脑模拟人、博取状元插金花/六杯红并记录奖池。
+                </p>
+              </div>
+
+              <div className="bg-red-950/70 border border-amber-400/30 rounded-xl p-3 space-y-2">
+                <p className="font-bold text-amber-300">
+                  💡 为什么提示未连接服务端？
+                </p>
+                <p className="text-[11px] text-amber-200/80">
+                  如果您将代码放到自己的 Linux / 宝塔 / 阿里云 / 腾讯云服务器：
+                </p>
+                <ul className="list-disc list-inside space-y-1 text-[11px] text-amber-200/70">
+                  <li><strong>原因 1：仅部署了静态 HTML</strong>。多人实时同桌依赖 Node.js 提供的 SSE 广播后端，需启动 Node 服务。</li>
+                  <li><strong>原因 2：Nginx 未反向代理 /api/</strong>。如果前端在 Nginx 80 端口，需把接口转发给 Node 服务的 3000 端口。</li>
+                </ul>
+              </div>
+
+              <div className="bg-black/40 border border-amber-300/30 rounded-xl p-3 space-y-2 font-mono text-[11px]">
+                <p className="text-amber-300 font-sans font-bold text-xs">🚀 极速启动多人联机服务端 (两步)：</p>
+                <div className="bg-black/60 p-2.5 rounded-lg text-emerald-300 overflow-x-auto select-all">
+                  <p># 1. 编译并启动 Node.js 全双工服务</p>
+                  <p>npm run build</p>
+                  <p>npm start  # 或者用 pm2: pm2 start dist/server.cjs --name bobing</p>
+                </div>
+                <div className="bg-black/60 p-2.5 rounded-lg text-amber-200/90 overflow-x-auto select-all">
+                  <p className="text-amber-400 font-sans font-bold mb-1"># 2. Nginx 反代配置参考 (支持 SSE 实时长连接)：</p>
+                  <pre className="text-[10px] leading-tight text-amber-100">
+{`location / {
+    proxy_pass http://127.0.0.1:3000;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection 'upgrade';
+    proxy_set_header Host $host;
+    proxy_cache_bypass $http_upgrade;
+    # 关键：关闭缓冲区以保证 SSE 广播毫秒级推送
+    proxy_buffering off;
+}`}
+                  </pre>
+                </div>
+              </div>
+            </div>
+
+            <div className="flex justify-end pt-1">
+              <button
+                type="button"
+                onClick={() => setShowDeployModal(false)}
+                className="px-5 py-2 rounded-xl bg-gradient-to-r from-amber-400 to-yellow-500 hover:from-amber-300 hover:to-yellow-400 text-red-950 font-bold text-xs shadow-md cursor-pointer"
+              >
+                我知道了，返回游戏
               </button>
             </div>
           </div>

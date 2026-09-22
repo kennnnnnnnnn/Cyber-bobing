@@ -4,7 +4,7 @@ import { createServer as createViteServer } from 'vite';
 import { BobingResult, GameState, Player, PrizePool, RollRecord } from './src/types';
 import { evaluateDice, INITIAL_PRIZES, rollRandomDice } from './src/utils/bobingRules';
 
-const PORT = 3000;
+const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 
 // 全局内存中的博饼游戏房间状态（同桌所有人共享）
 let gameState: GameState = {
@@ -41,7 +41,26 @@ function broadcastState() {
 
 async function startServer() {
   const app = express();
+
+  // 跨域支持 (防止用户在服务器上前后端不同端口或代理时跨域被浏览器拦截)
+  app.use((req, res, next) => {
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+    if (req.method === 'OPTIONS') {
+      res.sendStatus(200);
+      return;
+    }
+    next();
+  });
+
   app.use(express.json());
+  app.use(express.urlencoded({ extended: true }));
+
+  // 健康检查端点
+  app.get('/api/health', (req, res) => {
+    res.json({ status: 'ok', onlineCount: sseClients.length, time: Date.now() });
+  });
 
   // === SSE 实时长连接端点 ===
   app.get('/api/game/events', (req, res) => {
